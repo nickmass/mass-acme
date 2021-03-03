@@ -1,45 +1,72 @@
-extern crate acme_client;
-extern crate clap;
-#[macro_use]
-extern crate failure;
-#[macro_use]
-extern crate log;
-extern crate env_logger;
-extern crate rusoto_core;
-extern crate rusoto_credential;
-extern crate rusoto_route53;
-extern crate serde;
-#[macro_use]
-extern crate serde_derive;
-extern crate serde_json;
-
-use acme_client::openssl::pkey::{PKey, Private};
-use acme_client::openssl::x509::X509Req;
-use acme_client::Directory;
-use failure::{Error, ResultExt};
+use acme2_slim::Directory;
+use acme2_slim::{cert::SignedCertificate, error::Error as AcmeClientError};
+use log::{error, info};
+use openssl::{
+    asn1::Asn1Time,
+    pkey::{PKey, Private},
+    x509::{X509Req, X509},
+};
 use rusoto_credential::StaticProvider;
 use rusoto_route53::{Route53, Route53Client};
+use serde::{Deserialize, Serialize};
+use tokio_compat_02::FutureExt;
 
-use std::fs::File;
-use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::{cmp::Ordering, io::Read};
+use std::{fs::File, time::Duration};
 
-#[derive(Fail, Debug)]
+type Error = Box<dyn std::error::Error>;
+
+#[derive(Debug)]
 enum AcmeError {
-    #[fail(
-        display = "Route53 DNS update took longer than {} seconds to propigate and has timed out",
-        _0
-    )]
     Route53PropigateTimeout(u64),
-    #[fail(
-        display = "Route53 returned an invalid response while waiting for propigation: {}",
-        _0
-    )]
     Route53InvalidChangeResponse(String),
-    #[fail(display = "Unable to get Acme DNS challenge")]
     NoAcmeDnsChallenge,
-    #[fail(display = "Error returned from acme_client: {}", _0)]
-    AcmeClient(acme_client::error::ErrorKind),
+    AcmeClient(AcmeClientError),
+}
+
+impl std::fmt::Display for AcmeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AcmeError::Route53PropigateTimeout(s) => {
+                write!(f, "dns failed to propigate after {}s", s)
+            }
+            AcmeError::Route53InvalidChangeResponse(e) => {
+                write!(f, "route 53 change failed: {}", e)
+            }
+            AcmeError::NoAcmeDnsChallenge => {
+                write!(f, "acme response did not contain DNS challenge")
+            }
+            AcmeError::AcmeClient(e) => write!(f, "acme client error: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for AcmeError {}
+
+impl From<AcmeClientError> for AcmeError {
+    fn from(err: AcmeClientError) -> Self {
+        AcmeError::AcmeClient(err)
+    }
+}
+
+async fn save_signed_certificate_with_intermediate<P: AsRef<Path>>(
+    cert: &SignedCertificate,
+    path: P,
+    intermediate: Option<&[u8]>,
+) -> Result<(), Error> {
+    cert.save_signed_certificate(path.as_ref()).compat().await?;
+    if let Some(intermediate_bytes) = intermediate {
+        let mut file = tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(path.as_ref())
+            .await?;
+        use tokio::io::AsyncWriteExt;
+        file.write_all(intermediate_bytes.as_ref()).await?;
+    }
+
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -90,6 +117,8 @@ struct Config {
     directory_url: Option<String>,
     intermediate_url: Option<String>,
     email_address: String,
+    reload_nginx: bool,
+    days_before_renew: u32,
 }
 
 impl Config {
@@ -102,12 +131,15 @@ impl Config {
 }
 
 fn main() {
-    let code = match run() {
+    let mut builder = ::env_logger::Builder::new();
+    builder.filter(None, ::log::LevelFilter::Info);
+    builder.init();
+
+    let rt = tokio::runtime::Runtime::new().expect("FATAL: unable to create tokio runtime");
+    let result = rt.block_on(run());
+    let code = match result {
         Err(e) => {
-            for e in e.iter_chain() {
-                error!("{}", e);
-            }
-            error!("{:?}", e);
+            error!("{}", e);
             1
         }
         _ => {
@@ -119,51 +151,80 @@ fn main() {
     std::process::exit(code)
 }
 
-fn run() -> Result<(), Error> {
-    let mut builder = ::env_logger::Builder::new();
-    builder.filter(None, ::log::LevelFilter::Info);
-    builder.init();
-
+async fn run() -> Result<(), Error> {
     let mut args = std::env::args();
     let _executable_name = args.next();
     let config = args.next().unwrap_or(String::from("config.json"));
 
     info!("Loading config from: {}", config);
-    let config = load_config(&config).context(format!("Unable to load config: {}", config))?;
+    let config = load_config(&config)?;
     info!("Config loaded");
+    let _ = tokio::fs::create_dir_all(&*config.certificate_directory).await?;
 
-    let dns_client = DnsClient::new(&config).context("Could not create route53 client")?;
+    let renew_days = Asn1Time::days_from_now(config.days_before_renew)?;
+    let mut expiring_certs = Vec::new();
+    for cert in &config.certs {
+        let cert_path = cert.cert_path(&config.certificate_directory);
 
-    let _ = std::fs::create_dir_all(&*config.certificate_directory)
-        .context("Could not create SSL directory")?;
+        info!("Checking for existing cert: {}", cert_path.display());
+        if tokio::fs::metadata(&cert_path).await.is_err() {
+            info!(
+                "Cert does not exist, will be created: {}",
+                cert_path.display()
+            );
+            expiring_certs.push(cert);
+            continue;
+        }
+        let cert_contents = tokio::fs::read(&cert_path).await?;
+        let parsed_cert = X509::from_pem(&cert_contents)?;
+        match parsed_cert.not_after().compare(&renew_days)? {
+            Ordering::Less => {
+                info!(
+                    "Cert expires in less than {} days, will be renewed: {}",
+                    config.days_before_renew,
+                    cert_path.display()
+                );
+                expiring_certs.push(cert)
+            }
+            _ => {
+                info!(
+                    "Cert up to date, will not be renewed: {}",
+                    cert_path.display()
+                );
+            }
+        }
+    }
+
+    if expiring_certs.is_empty() {
+        info!("All certificates up to date");
+        return Ok(());
+    }
+
+    let dns_client = DnsClient::new(&config)?;
 
     let dir_url = &*config
         .directory_url
         .as_ref()
         .map(String::as_str)
-        .unwrap_or(acme_client::LETSENCRYPT_DIRECTORY_URL);
+        .unwrap_or(acme2_slim::LETSENCRYPT_DIRECTORY_URL);
     info!("Creating ACME directory: {}", dir_url);
-    let dir = Directory::from_url(dir_url)
-        .map_err(|e| AcmeError::AcmeClient(e.0))
-        .context("Unable to create ACME Directory")?;
+    let dir = Directory::from_url(dir_url).compat().await?;
 
-    let account = {
+    let mut account = {
         let account_key_path = config.account_key_path();
         info!(
             "Checking for account key in: {}",
             account_key_path.display()
         );
-        if let Some(account_key) =
-            load_key(&account_key_path).context("Could not open account key")?
-        {
+        if let Some(account_key) = load_key(&account_key_path)? {
             info!("Account key found");
             info!("Registering account");
             dir.account_registration()
                 .email(&*config.email_address)
                 .pkey(account_key)
                 .register()
-                .map_err(|e| AcmeError::AcmeClient(e.0))
-                .context("Unable to register account")?
+                .compat()
+                .await?
         } else {
             info!("No account key found, generating");
             info!("Registering account");
@@ -171,69 +232,53 @@ fn run() -> Result<(), Error> {
                 .account_registration()
                 .email(&*config.email_address)
                 .register()
-                .map_err(|e| AcmeError::AcmeClient(e.0))
-                .context("Unable to register account and generate account key")?;
+                .compat()
+                .await?;
 
             info!("Storing account key in: {}", account_key_path.display());
-            account
-                .save_private_key(account_key_path)
-                .map_err(|e| AcmeError::AcmeClient(e.0))
-                .context("Unable to save account key")?;
+            account.save_private_key(account_key_path).compat().await?;
 
             account
         }
     };
 
-    for cert in &config.certs {
+    let intermediate_cert = if let Some(url) = config.intermediate_url.as_ref() {
+        info!("Downloading intermediate from: {}", url);
+        let bytes = reqwest::get(url).await?.bytes().await?;
+        Some(bytes)
+    } else {
+        None
+    };
+
+    for cert in &expiring_certs {
         info!("Begin certificate: {}", cert.name);
-        for domain in &cert.domains {
-            info!("Begin authenticating: {}", domain);
-            let auth = account
-                .authorization(domain)
-                .map_err(|e| AcmeError::AcmeClient(e.0))
-                .context(format!("Unable to create auhtorization for: {}", domain))?;
+        let order = account.create_order(&cert.domains).compat().await?;
+        for challenge in order.get_dns_challenges() {
+            let dns_name = format!(
+                "_acme-challenge.{}",
+                challenge.domain().ok_or(AcmeError::NoAcmeDnsChallenge)?
+            );
+            let dns_value = challenge.signature()?;
 
-            info!("Getting DNS challenge");
-            let challenge = auth
-                .get_dns_challenge()
-                .ok_or(AcmeError::NoAcmeDnsChallenge)
-                .context(format!("Unable to get DNS challenge for: {}", domain))?;
+            dns_client.set_dns_record(dns_name, dns_value).await?;
 
-            let dns_name = format!("_acme-challenge.{}", domain);
-            let dns_value = challenge
-                .signature()
-                .map_err(|e| AcmeError::AcmeClient(e.0))
-                .context(format!("Unable to get DNS signature for: {}", domain))?;
-
-            info!("Setting challenge record on: {}", dns_name);
-            dns_client
-                .set_dns_record(&*dns_name, &*dns_value)
-                .context(format!("Unable to set DNS record: {}", dns_name))?;
-
-            info!("Validating domain: {}", domain);
             challenge
-                .validate()
-                .map_err(|e| AcmeError::AcmeClient(e.0))
-                .context(format!("Validation failed for: {}", domain))?;
+                .validate(&account, Duration::from_secs(5))
+                .compat()
+                .await?;
         }
 
         let cert_dir = cert.directory(&*config.certificate_directory);
         info!("Creating certificate directory: {}", cert_dir.display());
-        let _ = std::fs::create_dir_all(cert_dir).context(format!(
-            "Unable to create cert directory for: {}",
-            cert.name
-        ))?;
+        let _ = tokio::fs::create_dir_all(cert_dir).await?;
 
-        let domains: Vec<_> = cert.domains.iter().map(String::as_str).collect();
-        let mut cert_signer = account.certificate_signer(&*domains);
+        let mut cert_signer = account.certificate_signer();
         let mut write_csr = true;
         let mut write_key = true;
 
         let csr_file = cert.csr_path(&*config.certificate_directory);
         info!("Checking for existing CSR in: {}", csr_file.display());
-        if let Some(csr) =
-            load_csr(&csr_file).context(format!("Unable to read csr for: {}", cert.name))?
-        {
+        if let Some(csr) = load_csr(&csr_file)? {
             info!("Existing CSR found");
             cert_signer = cert_signer.csr(csr);
             write_csr = false;
@@ -243,9 +288,7 @@ fn run() -> Result<(), Error> {
 
         let key_file = cert.key_path(&*config.certificate_directory);
         info!("Checking for existing key in: {}", key_file.display());
-        if let Some(key) =
-            load_key(&key_file).context(format!("Unable to read key for: {}", cert.name))?
-        {
+        if let Some(key) = load_key(&key_file)? {
             info!("Existing key found");
             cert_signer = cert_signer.pkey(key);
             write_key = false;
@@ -254,25 +297,19 @@ fn run() -> Result<(), Error> {
         }
 
         info!("Signing cert");
-        let signed_cert = cert_signer
-            .sign_certificate()
-            .map_err(|e| AcmeError::AcmeClient(e.0))
-            .context(format!("Unable to sign certificate for: {}", cert.name))?;
+        let signed_cert = cert_signer.sign_certificate(&order).compat().await?;
 
         if write_csr {
             info!("Saving CSR to: {}", csr_file.display());
             signed_cert
                 .save_csr(cert.csr_path(&*config.certificate_directory))
-                .map_err(|e| AcmeError::AcmeClient(e.0))
-                .context(format!("Unable to save CSR for: {}", cert.name))?;
+                .compat()
+                .await?;
         }
 
         if write_key {
             info!("Saving key to: {}", key_file.display());
-            signed_cert
-                .save_private_key(key_file)
-                .map_err(|e| AcmeError::AcmeClient(e.0))
-                .context(format!("Unable to save Key for: {}", cert.name))?;
+            signed_cert.save_private_key(key_file).compat().await?;
         }
 
         let cert_file = cert.cert_path(&*config.certificate_directory);
@@ -280,13 +317,18 @@ fn run() -> Result<(), Error> {
             "Saving signed cert and intermediate to: {}",
             cert_file.display()
         );
-        signed_cert
-            .save_signed_certificate_and_chain(
-                config.intermediate_url.as_ref().map(String::as_str),
-                cert_file,
-            )
-            .map_err(|e| AcmeError::AcmeClient(e.0))
-            .context(format!("Unable to save Certificate for: {}", cert.name))?;
+
+        let intermediate = intermediate_cert.as_ref().map(|b| b.as_ref());
+        save_signed_certificate_with_intermediate(&signed_cert, &cert_file, intermediate).await?;
+    }
+
+    if config.reload_nginx {
+        info!("Sending reload signal to nginx");
+        let mut cmd = Command::new("nginx");
+        cmd.args(&["-s", "reload"]);
+
+        let status = cmd.spawn()?.wait()?;
+        info!("nginx signal exited with status: {}", status);
     }
 
     Ok(())
@@ -346,7 +388,11 @@ impl DnsClient {
         Ok(client)
     }
 
-    fn set_dns_record<S: AsRef<str>, T: AsRef<str>>(&self, name: S, value: T) -> Result<(), Error> {
+    async fn set_dns_record<S: AsRef<str>, T: AsRef<str>>(
+        &self,
+        name: S,
+        value: T,
+    ) -> Result<(), Error> {
         use rusoto_route53::{
             Change, ChangeBatch, ChangeResourceRecordSetsRequest, ResourceRecord, ResourceRecordSet,
         };
@@ -357,7 +403,7 @@ impl DnsClient {
         let record = ResourceRecord { value };
 
         let record_set = ResourceRecordSet {
-            name: name,
+            name,
             resource_records: Some(vec![record]),
             ttl: Some(60),
             type_: String::from("TXT"),
@@ -375,18 +421,18 @@ impl DnsClient {
         };
 
         let change_req = ChangeResourceRecordSetsRequest {
-            change_batch: change_batch,
+            change_batch,
             hosted_zone_id: self.config.aws_zone_id.clone(),
         };
 
         info!("Submitting DNS change");
-        let change = client.change_resource_record_sets(change_req).sync()?;
+        let change = client.change_resource_record_sets(change_req).await?;
         info!("DNS change submitted");
 
-        self.wait_for_change(change.change_info.id)
+        self.wait_for_change(change.change_info.id).await
     }
 
-    fn wait_for_change(&self, change_id: String) -> Result<(), Error> {
+    async fn wait_for_change(&self, change_id: String) -> Result<(), Error> {
         use rusoto_route53::GetChangeRequest;
         let client = self.create_client()?;
         let id = change_id
@@ -400,7 +446,7 @@ impl DnsClient {
         let mut total_time = self.config.aws_max_wait as i64;
         let next_delay = 20;
         loop {
-            let res = client.get_change(get_change.clone()).sync()?;
+            let res = client.get_change(get_change.clone()).await?;
 
             match &*res.change_info.status {
                 "INSYNC" => return Ok(()),
@@ -417,7 +463,7 @@ impl DnsClient {
             if total_time < 0 {
                 Err(AcmeError::Route53PropigateTimeout(self.config.aws_max_wait))?
             }
-            std::thread::sleep(std::time::Duration::from_secs(next_delay as u64));
+            tokio::time::sleep(Duration::from_secs(next_delay as u64)).await;
         }
     }
 }
