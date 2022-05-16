@@ -2,19 +2,18 @@
 authors = ["Nick Massey <nickmass@nickmass.com>"]
 name = "mass-acme"
 version = "0.1.0"
-edition = "2018"
+edition = "2021"
 
 [dependencies]
-clap = "2.33"
-env_logger = "0.8.3"
+env_logger = "0.9"
 log = "0.4.14"
-rusoto_core = "0.46.0"
-rusoto_credential = "0.46.0"
-rusoto_route53 = "0.46.0"
+rusoto_core = "0.48"
+rusoto_credential = "0.48"
+rusoto_route53 = "0.48"
 serde = {version = "1.0", features = ["derive"]}
 serde_json = "1.0"
 acme2-slim = {git ="https://github.com/nickmass/acme2-slim.git", branch = "main"}
 openssl = "0.10.32"
-tokio = {version = "1.2.0", features = ["fs", "rt", "time"]}
+tokio = {version = "1.6", features = ["fs", "rt", "time"]}
 reqwest = "0.11.1"
 tokio-compat-02 = "0.2.0"

@@ -119,6 +119,7 @@ struct Config {
     email_address: String,
     reload_nginx: bool,
     days_before_renew: u32,
+    nginx_path: String,
 }
 
 impl Config {
@@ -324,7 +325,7 @@ async fn run() -> Result<(), Error> {
 
     if config.reload_nginx {
         info!("Sending reload signal to nginx");
-        let mut cmd = Command::new("nginx");
+        let mut cmd = Command::new(&config.nginx_path);
         cmd.args(&["-s", "reload"]);
 
         let status = cmd.spawn()?.wait()?;
