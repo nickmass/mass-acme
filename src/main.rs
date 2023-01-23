@@ -1,6 +1,7 @@
-use acme2_slim::Directory;
-use acme2_slim::{cert::SignedCertificate, error::Error as AcmeClientError};
-use log::{error, info};
+use acme2::{
+    AccountBuilder, AuthorizationStatus, ChallengeStatus, Csr, DirectoryBuilder, OrderBuilder,
+    OrderStatus, ServerError,
+};
 use openssl::{
     asn1::Asn1Time,
     pkey::{PKey, Private},
@@ -9,12 +10,14 @@ use openssl::{
 use rusoto_credential::StaticProvider;
 use rusoto_route53::{Route53, Route53Client};
 use serde::{Deserialize, Serialize};
-use tokio_compat_02::FutureExt;
+use tracing::{error, info};
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::{cmp::Ordering, io::Read};
-use std::{fs::File, time::Duration};
+use std::{
+    cmp::Ordering,
+    path::{Path, PathBuf},
+    process::Command,
+    time::Duration,
+};
 
 type Error = Box<dyn std::error::Error>;
 
@@ -23,7 +26,10 @@ enum AcmeError {
     Route53PropigateTimeout(u64),
     Route53InvalidChangeResponse(String),
     NoAcmeDnsChallenge,
-    AcmeClient(AcmeClientError),
+    AcmeChallengeInvalid(Option<ServerError>),
+    AcmeAuthorizationInvalid,
+    AcmeOrderInvalid(Option<ServerError>),
+    NoAcmeOrderCertificates,
 }
 
 impl std::fmt::Display for AcmeError {
@@ -38,36 +44,17 @@ impl std::fmt::Display for AcmeError {
             AcmeError::NoAcmeDnsChallenge => {
                 write!(f, "acme response did not contain DNS challenge")
             }
-            AcmeError::AcmeClient(e) => write!(f, "acme client error: {}", e),
+            AcmeError::AcmeChallengeInvalid(err) => write!(f, "acme challenge invalid: {:?}", err),
+            AcmeError::AcmeAuthorizationInvalid => write!(f, "acme authorization invalid"),
+            AcmeError::AcmeOrderInvalid(err) => write!(f, "acme order invalid: {:?}", err),
+            AcmeError::NoAcmeOrderCertificates => {
+                write!(f, "acme order did not include any certificates")
+            }
         }
     }
 }
 
 impl std::error::Error for AcmeError {}
-
-impl From<AcmeClientError> for AcmeError {
-    fn from(err: AcmeClientError) -> Self {
-        AcmeError::AcmeClient(err)
-    }
-}
-
-async fn save_signed_certificate_with_intermediate<P: AsRef<Path>>(
-    cert: &SignedCertificate,
-    path: P,
-    intermediate: Option<&[u8]>,
-) -> Result<(), Error> {
-    cert.save_signed_certificate(path.as_ref()).compat().await?;
-    if let Some(intermediate_bytes) = intermediate {
-        let mut file = tokio::fs::OpenOptions::new()
-            .append(true)
-            .open(path.as_ref())
-            .await?;
-        use tokio::io::AsyncWriteExt;
-        file.write_all(intermediate_bytes.as_ref()).await?;
-    }
-
-    Ok(())
-}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ConfigCertificate {
@@ -105,6 +92,10 @@ impl ConfigCertificate {
     }
 }
 
+const LETS_ENCRYPT_DIRECTORY_URL: &'static str = "https://acme-v02.api.letsencrypt.org/directory";
+const LETS_ENCRYPT_STAGING_DIRECTORY_URL: &'static str =
+    "https://acme-staging-v02.api.letsencrypt.org/directory";
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Config {
     certs: Vec<ConfigCertificate>,
@@ -114,12 +105,30 @@ struct Config {
     aws_region: String,
     aws_zone_id: String,
     aws_max_wait: u64,
-    directory_url: Option<String>,
+    directory_url: Option<DirectoryUrl>,
     intermediate_url: Option<String>,
     email_address: String,
     reload_nginx: bool,
     days_before_renew: u32,
-    nginx_path: String,
+    nginx_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum DirectoryUrl {
+    LetsEncrypt,
+    LetsEncryptStaging,
+    Custom(String),
+}
+
+impl DirectoryUrl {
+    fn as_url(&self) -> &str {
+        match self {
+            DirectoryUrl::LetsEncrypt => LETS_ENCRYPT_DIRECTORY_URL,
+            DirectoryUrl::LetsEncryptStaging => LETS_ENCRYPT_STAGING_DIRECTORY_URL,
+            DirectoryUrl::Custom(url) => url.as_str(),
+        }
+    }
 }
 
 impl Config {
@@ -132,9 +141,7 @@ impl Config {
 }
 
 fn main() {
-    let mut builder = ::env_logger::Builder::new();
-    builder.filter(None, ::log::LevelFilter::Info);
-    builder.init();
+    tracing_subscriber::fmt::init();
 
     let rt = tokio::runtime::Runtime::new().expect("FATAL: unable to create tokio runtime");
     let result = rt.block_on(run());
@@ -155,10 +162,10 @@ fn main() {
 async fn run() -> Result<(), Error> {
     let mut args = std::env::args();
     let _executable_name = args.next();
-    let config = args.next().unwrap_or(String::from("config.json"));
+    let config = args.next().unwrap_or(String::from("config.toml"));
 
     info!("Loading config from: {}", config);
-    let config = load_config(&config)?;
+    let config = load_config(&config).await?;
     info!("Config loaded");
     let _ = tokio::fs::create_dir_all(&*config.certificate_directory).await?;
 
@@ -203,44 +210,45 @@ async fn run() -> Result<(), Error> {
 
     let dns_client = DnsClient::new(&config)?;
 
-    let dir_url = &*config
+    let dir_url = config
         .directory_url
         .as_ref()
-        .map(String::as_str)
-        .unwrap_or(acme2_slim::LETSENCRYPT_DIRECTORY_URL);
+        .map(DirectoryUrl::as_url)
+        .unwrap_or(LETS_ENCRYPT_DIRECTORY_URL)
+        .to_string();
     info!("Creating ACME directory: {}", dir_url);
-    let dir = Directory::from_url(dir_url).compat().await?;
 
-    let mut account = {
+    let dir = DirectoryBuilder::new(dir_url).build().await?;
+
+    let account = {
         let account_key_path = config.account_key_path();
         info!(
             "Checking for account key in: {}",
             account_key_path.display()
         );
-        if let Some(account_key) = load_key(&account_key_path)? {
+
+        let mut account_builder = AccountBuilder::new(dir.clone());
+        account_builder.contact(vec![format!("mailto:{}", config.email_address)]);
+        account_builder.terms_of_service_agreed(true);
+
+        let generate_key = if let Some(account_key) = load_key(&account_key_path).await? {
             info!("Account key found");
-            info!("Registering account");
-            dir.account_registration()
-                .email(&*config.email_address)
-                .pkey(account_key)
-                .register()
-                .compat()
-                .await?
+            account_builder.private_key(account_key);
+            false
         } else {
             info!("No account key found, generating");
-            info!("Registering account");
-            let account = dir
-                .account_registration()
-                .email(&*config.email_address)
-                .register()
-                .compat()
-                .await?;
+            true
+        };
 
+        info!("Registering account");
+        let account = account_builder.build().await?;
+
+        if generate_key {
             info!("Storing account key in: {}", account_key_path.display());
-            account.save_private_key(account_key_path).compat().await?;
-
-            account
+            save_key(&account_key_path, &account.private_key()).await?;
         }
+
+        account
     };
 
     let intermediate_cert = if let Some(url) = config.intermediate_url.as_ref() {
@@ -253,65 +261,97 @@ async fn run() -> Result<(), Error> {
 
     for cert in &expiring_certs {
         info!("Begin certificate: {}", cert.name);
-        let order = account.create_order(&cert.domains).compat().await?;
-        for challenge in order.get_dns_challenges() {
-            let dns_name = format!(
-                "_acme-challenge.{}",
-                challenge.domain().ok_or(AcmeError::NoAcmeDnsChallenge)?
-            );
-            let dns_value = challenge.signature()?;
+        let mut order_builder = OrderBuilder::new(account.clone());
+        for domain in cert.domains.iter() {
+            order_builder.add_dns_identifier(domain.clone());
+        }
+        let order = order_builder.build().await?;
 
+        let authorizations = order.authorizations().await?;
+
+        for auth in authorizations {
+            let challenge = auth
+                .get_challenge("dns-01")
+                .ok_or(AcmeError::NoAcmeDnsChallenge)?;
+
+            info!(
+                "Performing challenge {} {}",
+                auth.identifier.r#type, auth.identifier.value
+            );
+
+            let domain = if auth.wildcard.unwrap_or(false) {
+                auth.identifier.value.trim_start_matches("*.").to_string()
+            } else {
+                auth.identifier.value.clone()
+            };
+
+            let dns_name = format!("_acme-challenge.{}", domain);
+            let dns_value = challenge
+                .key_authorization_encoded()?
+                .ok_or(AcmeError::NoAcmeDnsChallenge)?;
+            info!("Setting DNS challenge token: {}={}", dns_name, dns_value);
             dns_client.set_dns_record(dns_name, dns_value).await?;
 
-            challenge
-                .validate(&account, Duration::from_secs(5))
-                .compat()
-                .await?;
+            info!("Validating DNS challenge");
+            challenge.validate().await?;
+            let challenge = challenge.wait_done(Duration::from_secs(5), 12).await?;
+            if challenge.status != ChallengeStatus::Valid {
+                error!("Challenge validation failed: {:?}", challenge.status);
+                return Err(AcmeError::AcmeChallengeInvalid(challenge.error).into());
+            }
+
+            let auth = auth.wait_done(Duration::from_secs(5), 12).await?;
+            if auth.status != AuthorizationStatus::Valid {
+                error!("Authorization validation failed: {:?}", auth.status);
+                return Err(AcmeError::AcmeAuthorizationInvalid.into());
+            }
+        }
+
+        let order = order.wait_ready(Duration::from_secs(5), 12).await?;
+        if order.status != OrderStatus::Ready {
+            error!("Order validation failed: {:?}", order.status);
+            return Err(AcmeError::AcmeOrderInvalid(order.error).into());
         }
 
         let cert_dir = cert.directory(&*config.certificate_directory);
         info!("Creating certificate directory: {}", cert_dir.display());
         let _ = tokio::fs::create_dir_all(cert_dir).await?;
 
-        let mut cert_signer = account.certificate_signer();
-        let mut write_csr = true;
-        let mut write_key = true;
+        let key_file = cert.key_path(&*config.certificate_directory);
+        info!("Checking for existing key in: {}", key_file.display());
+        let key = if let Some(key) = load_key(&key_file).await? {
+            info!("Existing key found");
+            key
+        } else {
+            info!("No key found, generating");
+            let key = acme2::gen_rsa_private_key(4096)?;
+            info!("Saving key to: {}", key_file.display());
+            save_key(key_file, &key).await?;
+            key
+        };
 
         let csr_file = cert.csr_path(&*config.certificate_directory);
         info!("Checking for existing CSR in: {}", csr_file.display());
-        if let Some(csr) = load_csr(&csr_file)? {
+        let csr = if let Some(csr) = load_csr(&csr_file).await? {
             info!("Existing CSR found");
-            cert_signer = cert_signer.csr(csr);
-            write_csr = false;
+            Csr::Custom(csr)
         } else {
             info!("No CSR found, generating");
+            Csr::Automatic(key)
+        };
+
+        info!("Finalizing cert");
+        let order = order.finalize(csr).await?;
+        let order = order.wait_done(Duration::from_secs(5), 12).await?;
+        if order.status != OrderStatus::Valid {
+            error!("Order finalization failed: {:?}", order.status);
+            return Err(AcmeError::AcmeOrderInvalid(order.error).into());
         }
 
-        let key_file = cert.key_path(&*config.certificate_directory);
-        info!("Checking for existing key in: {}", key_file.display());
-        if let Some(key) = load_key(&key_file)? {
-            info!("Existing key found");
-            cert_signer = cert_signer.pkey(key);
-            write_key = false;
-        } else {
-            info!("No key found, generating");
-        }
-
-        info!("Signing cert");
-        let signed_cert = cert_signer.sign_certificate(&order).compat().await?;
-
-        if write_csr {
-            info!("Saving CSR to: {}", csr_file.display());
-            signed_cert
-                .save_csr(cert.csr_path(&*config.certificate_directory))
-                .compat()
-                .await?;
-        }
-
-        if write_key {
-            info!("Saving key to: {}", key_file.display());
-            signed_cert.save_private_key(key_file).compat().await?;
-        }
+        let certificates = order
+            .certificate()
+            .await?
+            .ok_or(AcmeError::NoAcmeOrderCertificates)?;
 
         let cert_file = cert.cert_path(&*config.certificate_directory);
         info!(
@@ -320,53 +360,89 @@ async fn run() -> Result<(), Error> {
         );
 
         let intermediate = intermediate_cert.as_ref().map(|b| b.as_ref());
-        save_signed_certificate_with_intermediate(&signed_cert, &cert_file, intermediate).await?;
+        save_signed_certificate_with_intermediate(&certificates, &cert_file, intermediate).await?;
     }
 
     if config.reload_nginx {
-        info!("Sending reload signal to nginx");
-        let mut cmd = Command::new(&config.nginx_path);
-        cmd.args(&["-s", "reload"]);
+        if let Some(nginx_path) = config.nginx_path.as_ref() {
+            info!("Sending reload signal to nginx");
+            let mut cmd = Command::new(nginx_path);
+            cmd.args(&["-s", "reload"]);
 
-        let status = cmd.spawn()?.wait()?;
-        info!("nginx signal exited with status: {}", status);
+            let status = cmd.spawn()?.wait()?;
+            info!("nginx signal exited with status: {}", status);
+        } else {
+            error!("Unable to reload nginx, nginx_path unset");
+        }
     }
 
     Ok(())
 }
 
-fn load_config<P: AsRef<Path>>(path: P) -> Result<Config, Error> {
+async fn load_config<P: AsRef<Path>>(path: P) -> Result<Config, Error> {
     let path = path.as_ref();
 
-    let file = File::open(path)?;
+    let text = tokio::fs::read_to_string(path).await?;
 
-    Ok(serde_json::from_reader(file)?)
+    Ok(toml::from_str(text.as_str())?)
 }
 
-fn load_key<P: AsRef<Path>>(path: P) -> Result<Option<PKey<Private>>, Error> {
+async fn load_key<P: AsRef<Path>>(path: P) -> Result<Option<PKey<Private>>, Error> {
     let path = path.as_ref();
-    if !path.is_file() {
+    if !tokio::fs::metadata(path)
+        .await
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+    {
         return Ok(None);
     }
 
-    let mut buf = Vec::new();
-    let mut file = File::open(path)?;
-    let _ = file.read_to_end(&mut buf)?;
+    let bytes = tokio::fs::read(path).await?;
 
-    Ok(Some(PKey::private_key_from_pem(&*buf)?))
+    Ok(Some(PKey::private_key_from_pem(&bytes)?))
 }
 
-fn load_csr<P: AsRef<Path>>(path: P) -> Result<Option<X509Req>, Error> {
+async fn save_key<P: AsRef<Path>>(path: P, key: &PKey<Private>) -> Result<(), Error> {
     let path = path.as_ref();
-    if !path.is_file() {
+
+    let bytes = key.private_key_to_pem_pkcs8()?;
+    tokio::fs::write(path, bytes).await?;
+
+    Ok(())
+}
+
+async fn load_csr<P: AsRef<Path>>(path: P) -> Result<Option<X509Req>, Error> {
+    let path = path.as_ref();
+    if !tokio::fs::metadata(path)
+        .await
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+    {
         return Ok(None);
     }
 
-    let mut buf = Vec::new();
-    let mut file = File::open(path)?;
-    let _ = file.read_to_end(&mut buf)?;
+    let bytes = tokio::fs::read(path).await?;
 
-    Ok(Some(X509Req::from_pem(&*buf)?))
+    Ok(Some(X509Req::from_pem(&bytes)?))
+}
+
+async fn save_signed_certificate_with_intermediate<P: AsRef<Path>>(
+    certs: &Vec<X509>,
+    path: P,
+    intermediate: Option<&[u8]>,
+) -> Result<(), Error> {
+    let mut bytes = Vec::new();
+
+    for cert in certs {
+        bytes.extend(cert.to_pem()?);
+    }
+
+    if let Some(intermediate_bytes) = intermediate {
+        bytes.extend(intermediate_bytes);
+    }
+    tokio::fs::write(path.as_ref(), bytes).await?;
+
+    Ok(())
 }
 
 struct DnsClient {
