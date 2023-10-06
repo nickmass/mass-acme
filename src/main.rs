@@ -25,6 +25,7 @@ type Error = Box<dyn std::error::Error>;
 enum AcmeError {
     Route53PropigateTimeout(u64),
     Route53InvalidChangeResponse(String),
+    NoSubjectCertificate,
     NoAcmeDnsChallenge,
     AcmeChallengeInvalid(Option<ServerError>),
     AcmeAuthorizationInvalid,
@@ -50,6 +51,10 @@ impl std::fmt::Display for AcmeError {
             AcmeError::NoAcmeOrderCertificates => {
                 write!(f, "acme order did not include any certificates")
             }
+            AcmeError::NoSubjectCertificate => write!(
+                f,
+                "existing certificate file did not contain subject certificate"
+            ),
         }
     }
 }
@@ -184,8 +189,10 @@ async fn run() -> Result<(), Error> {
             continue;
         }
         let cert_contents = tokio::fs::read(&cert_path).await?;
-        let parsed_cert = X509::from_pem(&cert_contents)?;
-        match parsed_cert.not_after().compare(&renew_days)? {
+        let mut parsed_certs = X509::stack_from_pem(&cert_contents)?.into_iter();
+        let subject_cert = parsed_certs.next().ok_or(AcmeError::NoSubjectCertificate)?;
+
+        match subject_cert.not_after().compare(&renew_days)? {
             Ordering::Less => {
                 info!(
                     "Cert expires in less than {} days, will be renewed: {}",
@@ -207,8 +214,6 @@ async fn run() -> Result<(), Error> {
         info!("All certificates up to date");
         return Ok(());
     }
-
-    let dns_client = DnsClient::new(&config)?;
 
     let dir_url = config
         .directory_url
@@ -251,13 +256,7 @@ async fn run() -> Result<(), Error> {
         account
     };
 
-    let intermediate_cert = if let Some(url) = config.intermediate_url.as_ref() {
-        info!("Downloading intermediate from: {}", url);
-        let bytes = reqwest::get(url).await?.bytes().await?;
-        Some(bytes)
-    } else {
-        None
-    };
+    let dns_client = DnsClient::new(&config)?;
 
     for cert in &expiring_certs {
         info!("Begin certificate: {}", cert.name);
@@ -359,8 +358,7 @@ async fn run() -> Result<(), Error> {
             cert_file.display()
         );
 
-        let intermediate = intermediate_cert.as_ref().map(|b| b.as_ref());
-        save_signed_certificate_with_intermediate(&certificates, &cert_file, intermediate).await?;
+        save_signed_certificate(&certificates, &cert_file).await?;
     }
 
     if config.reload_nginx {
@@ -426,20 +424,13 @@ async fn load_csr<P: AsRef<Path>>(path: P) -> Result<Option<X509Req>, Error> {
     Ok(Some(X509Req::from_pem(&bytes)?))
 }
 
-async fn save_signed_certificate_with_intermediate<P: AsRef<Path>>(
-    certs: &Vec<X509>,
-    path: P,
-    intermediate: Option<&[u8]>,
-) -> Result<(), Error> {
+async fn save_signed_certificate<P: AsRef<Path>>(certs: &Vec<X509>, path: P) -> Result<(), Error> {
     let mut bytes = Vec::new();
 
     for cert in certs {
         bytes.extend(cert.to_pem()?);
     }
 
-    if let Some(intermediate_bytes) = intermediate {
-        bytes.extend(intermediate_bytes);
-    }
     tokio::fs::write(path.as_ref(), bytes).await?;
 
     Ok(())
