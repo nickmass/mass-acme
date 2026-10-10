@@ -2,7 +2,7 @@
 authors = ["Nick Massey <nickmass@nickmass.com>"]
 name = "mass-acme"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 rusoto_core = "0.48"
@@ -12,7 +12,8 @@ serde = {version = "1.0", features = ["derive"]}
 openssl = "0.10.45"
 tokio = {version = "1.24", features = ["fs", "rt", "time"]}
 reqwest = "0.11.14"
-acme2 = "0.5.1"
+acme2 = { git = "https://github.com/nickmass/acme2.git" }
 tracing-subscriber = "0.3.16"
 tracing = "0.1.37"
 toml = "0.5.11"
+chrono = "0.4.45"

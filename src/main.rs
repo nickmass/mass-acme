@@ -1,21 +1,22 @@
 use acme2::{
-    AccountBuilder, AuthorizationStatus, ChallengeStatus, Csr, DirectoryBuilder, OrderBuilder,
-    OrderStatus, ServerError,
+    AccountBuilder, AuthorizationStatus, ChallengeStatus, Csr, Directory, DirectoryBuilder,
+    OrderBuilder, OrderStatus, Renewal, ServerError,
 };
 use openssl::{
     asn1::Asn1Time,
     pkey::{PKey, Private},
-    x509::{X509Req, X509},
+    x509::{X509, X509Ref, X509Req},
 };
 use rusoto_credential::StaticProvider;
 use rusoto_route53::{Route53, Route53Client};
 use serde::{Deserialize, Serialize};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use std::{
     cmp::Ordering,
     path::{Path, PathBuf},
     process::Command,
+    sync::Arc,
     time::Duration,
 };
 
@@ -174,7 +175,23 @@ async fn run() -> Result<(), Error> {
     info!("Config loaded");
     let _ = tokio::fs::create_dir_all(&*config.certificate_directory).await?;
 
+    let dir_url = config
+        .directory_url
+        .as_ref()
+        .map(DirectoryUrl::as_url)
+        .unwrap_or(LETS_ENCRYPT_DIRECTORY_URL)
+        .to_string();
+    info!("Creating ACME directory: {}", dir_url);
+
+    let dir = DirectoryBuilder::new(dir_url).build().await?;
+
     let renew_days = Asn1Time::days_from_now(config.days_before_renew)?;
+
+    struct ExpiringCert<'a> {
+        config: &'a ConfigCertificate,
+        replaces: Option<X509>,
+    }
+
     let mut expiring_certs = Vec::new();
     for cert in &config.certs {
         let cert_path = cert.cert_path(&config.certificate_directory);
@@ -185,7 +202,10 @@ async fn run() -> Result<(), Error> {
                 "Cert does not exist, will be created: {}",
                 cert_path.display()
             );
-            expiring_certs.push(cert);
+            expiring_certs.push(ExpiringCert {
+                config: cert,
+                replaces: None,
+            });
             continue;
         }
         let cert_contents = tokio::fs::read(&cert_path).await?;
@@ -199,13 +219,39 @@ async fn run() -> Result<(), Error> {
                     config.days_before_renew,
                     cert_path.display()
                 );
-                expiring_certs.push(cert)
+                expiring_certs.push(ExpiringCert {
+                    config: cert,
+                    replaces: Some(subject_cert),
+                })
             }
             _ => {
-                info!(
-                    "Cert up to date, will not be renewed: {}",
-                    cert_path.display()
-                );
+                info!("Querying acme renewal endpoint: {}", cert_path.display());
+
+                match query_renewal_info(dir.clone(), subject_cert.as_ref()).await {
+                    Ok(RenewResult::Renew) => {
+                        info!(
+                            "Cert entered renewal window, will be renewed: {}",
+                            cert_path.display()
+                        );
+                        expiring_certs.push(ExpiringCert {
+                            config: cert,
+                            replaces: Some(subject_cert),
+                        })
+                    }
+                    Ok(RenewResult::UpToDate) => {
+                        info!(
+                            "Cert up to date, will not be renewed: {}",
+                            cert_path.display()
+                        );
+                    }
+                    Err(err) => {
+                        error!("Unable to query renewal endpoint: {:?}", err);
+                        info!(
+                            "Cert up to date, will not be renewed: {}",
+                            cert_path.display()
+                        );
+                    }
+                }
             }
         }
     }
@@ -214,16 +260,6 @@ async fn run() -> Result<(), Error> {
         info!("All certificates up to date");
         return Ok(());
     }
-
-    let dir_url = config
-        .directory_url
-        .as_ref()
-        .map(DirectoryUrl::as_url)
-        .unwrap_or(LETS_ENCRYPT_DIRECTORY_URL)
-        .to_string();
-    info!("Creating ACME directory: {}", dir_url);
-
-    let dir = DirectoryBuilder::new(dir_url).build().await?;
 
     let account = {
         let account_key_path = config.account_key_path();
@@ -259,11 +295,18 @@ async fn run() -> Result<(), Error> {
     let dns_client = DnsClient::new(&config)?;
 
     for cert in &expiring_certs {
-        info!("Begin certificate: {}", cert.name);
+        info!("Begin certificate: {}", cert.config.name);
         let mut order_builder = OrderBuilder::new(account.clone());
-        for domain in cert.domains.iter() {
+        for domain in cert.config.domains.iter() {
             order_builder.add_dns_identifier(domain.clone());
         }
+
+        if let Some(cert) = cert.replaces.as_ref() {
+            if let Err(err) = order_builder.set_replaces_certificate(cert.as_ref()) {
+                warn!("Unable to set replacement certificate in order: {:?}", err);
+            }
+        }
+
         let order = order_builder.build().await?;
 
         let authorizations = order.authorizations().await?;
@@ -312,11 +355,11 @@ async fn run() -> Result<(), Error> {
             return Err(AcmeError::AcmeOrderInvalid(order.error).into());
         }
 
-        let cert_dir = cert.directory(&*config.certificate_directory);
+        let cert_dir = cert.config.directory(&*config.certificate_directory);
         info!("Creating certificate directory: {}", cert_dir.display());
         let _ = tokio::fs::create_dir_all(cert_dir).await?;
 
-        let key_file = cert.key_path(&*config.certificate_directory);
+        let key_file = cert.config.key_path(&*config.certificate_directory);
         info!("Checking for existing key in: {}", key_file.display());
         let key = if let Some(key) = load_key(&key_file).await? {
             info!("Existing key found");
@@ -329,7 +372,7 @@ async fn run() -> Result<(), Error> {
             key
         };
 
-        let csr_file = cert.csr_path(&*config.certificate_directory);
+        let csr_file = cert.config.csr_path(&*config.certificate_directory);
         info!("Checking for existing CSR in: {}", csr_file.display());
         let csr = if let Some(csr) = load_csr(&csr_file).await? {
             info!("Existing CSR found");
@@ -352,7 +395,7 @@ async fn run() -> Result<(), Error> {
             .await?
             .ok_or(AcmeError::NoAcmeOrderCertificates)?;
 
-        let cert_file = cert.cert_path(&*config.certificate_directory);
+        let cert_file = cert.config.cert_path(&*config.certificate_directory);
         info!(
             "Saving signed cert and intermediate to: {}",
             cert_file.display()
@@ -434,6 +477,28 @@ async fn save_signed_certificate<P: AsRef<Path>>(certs: &Vec<X509>, path: P) -> 
     tokio::fs::write(path.as_ref(), bytes).await?;
 
     Ok(())
+}
+
+#[derive(Debug, Copy, Clone)]
+enum RenewResult {
+    Renew,
+    UpToDate,
+}
+
+async fn query_renewal_info(
+    directory: Arc<Directory>,
+    existing_cert: &X509Ref,
+) -> Result<RenewResult, Error> {
+    let renewal = Renewal::new(directory, existing_cert)?;
+    let res = renewal.query().await?;
+
+    info!("Renewal info: {:?}", res);
+
+    if res.suggested_window.start < chrono::Utc::now() {
+        Ok(RenewResult::Renew)
+    } else {
+        Ok(RenewResult::UpToDate)
+    }
 }
 
 struct DnsClient {
